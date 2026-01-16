@@ -164,6 +164,53 @@ export const apiLimiter = new RateLimiter(100, 60 * 1000);
 export const exportLimiter = new RateLimiter(10, 60 * 1000);
 ```
 
+### In-Memory vs Distributed Rate Limiting
+
+The examples above use in-memory storage. Choose your approach based on your deployment:
+
+#### In-Memory (Simple)
+```typescript
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+```
+
+| Pros | Cons |
+|------|------|
+| Zero configuration | Resets on server restart |
+| Fastest (no network call) | Doesn't work across multiple instances |
+| No external dependencies | Uses application memory |
+
+**Use when**: Single server instance, internal tools, rate limit reset on restart is acceptable.
+
+#### Distributed (Redis)
+```typescript
+import Redis from 'ioredis';
+const redis = new Redis(process.env.REDIS_URL);
+
+async function rateLimit(key: string, max: number, windowSec: number) {
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, windowSec);
+  return { allowed: count <= max, remaining: Math.max(0, max - count) };
+}
+```
+
+| Pros | Cons |
+|------|------|
+| Survives restarts | Requires Redis infrastructure |
+| Works across instances | Network latency per request |
+| Shared state | Additional cost/complexity |
+
+**Use when**: Multiple servers (load balanced), public APIs, high-security requirements, serverless deployments.
+
+#### Decision Guide
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Personal/internal app, single PM2 process | In-memory |
+| Production API, single server, can tolerate restart reset | In-memory |
+| Load-balanced, multiple instances | Redis required |
+| Public API with strict security requirements | Redis required |
+| Serverless (Vercel, Lambda) | Redis required (no persistent memory) |
+
 ## 3. Input Validation
 
 ### Core Principles
@@ -234,6 +281,64 @@ export default {
 };
 ```
 
+### CSP Nonces (Recommended)
+
+Using `'unsafe-inline'` in CSP defeats XSS protection. The proper solution is **nonces** - random tokens that mark trusted scripts.
+
+#### How It Works
+1. Generate a random nonce per request
+2. Add nonce to CSP header: `script-src 'self' 'nonce-abc123'`
+3. Add nonce attribute to trusted scripts: `<script nonce="abc123">`
+4. Browser blocks any script without the matching nonce
+
+#### Next.js Implementation
+
+**Middleware** - Generate nonce and set CSP header:
+```typescript
+// middleware.ts
+function generateCspHeader(nonce: string): string {
+  return [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}'`,
+    "style-src 'self' 'unsafe-inline'",  // Keep for Tailwind/CSS-in-JS
+    "img-src 'self' data: blob: https:",
+    "font-src 'self' data:",
+    "connect-src 'self' https:",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ].join("; ");
+}
+
+export async function middleware(request: NextRequest) {
+  const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+
+  const response = NextResponse.next();
+  response.headers.set('Content-Security-Policy', generateCspHeader(nonce));
+  response.headers.set('x-nonce', nonce);
+  return response;
+}
+```
+
+**Layout** - Read nonce for scripts:
+```typescript
+// app/layout.tsx
+import { headers } from 'next/headers';
+
+export default async function RootLayout({ children }) {
+  const headersList = await headers();
+  const nonce = headersList.get('x-nonce') || '';
+
+  return (
+    <html>
+      <body data-nonce={nonce}>{children}</body>
+    </html>
+  );
+}
+```
+
+**Note**: Keep `'unsafe-inline'` for `style-src` - removing it requires complex style nonce injection that breaks most CSS-in-JS libraries and Tailwind.
+
 ## 5. API Security
 
 ### API Key Best Practices
@@ -268,6 +373,61 @@ const userData = await prisma.resource.findMany({
   },
 });
 ```
+
+### API Route-Level Authentication
+
+**Middleware alone is not enough.** While middleware can protect page routes, API routes should also verify authentication at the handler level. This provides defense in depth and ensures APIs return proper 401 responses instead of redirects.
+
+#### Auth Helper Pattern
+```typescript
+// lib/auth.ts
+import { cookies } from 'next/headers';
+import { jwtVerify } from 'jose';
+import { NextResponse } from 'next/server';
+
+export async function requireAuth(): Promise<JWTPayload | NextResponse> {
+  const cookieStore = await cookies();
+  const token = cookieStore.get('auth-token')?.value;
+
+  if (!token) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  try {
+    const secret = new TextEncoder().encode(process.env.JWT_SECRET);
+    const { payload } = await jwtVerify(token, secret);
+
+    if (!payload.mfaVerified) {
+      return NextResponse.json({ error: 'MFA required' }, { status: 401 });
+    }
+
+    return payload as JWTPayload;
+  } catch {
+    return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
+  }
+}
+
+export function isAuthError(result: unknown): result is NextResponse {
+  return result instanceof NextResponse;
+}
+```
+
+#### Usage in API Routes
+```typescript
+// app/api/clients/route.ts
+import { requireAuth, isAuthError } from '@/lib/auth';
+
+export async function GET() {
+  const auth = await requireAuth();
+  if (isAuthError(auth)) return auth;  // Returns 401
+
+  // auth is now the verified JWT payload
+  const clients = await db.query('SELECT * FROM clients');
+  return NextResponse.json(clients);
+}
+```
+
+Apply this pattern to **every** API route except `/api/auth/*` endpoints.
 
 ## 6. Database Security
 
@@ -540,10 +700,12 @@ const emailHtml = `
 - [ ] All API endpoints rate limited (100/min)
 - [ ] Export/heavy operations stricter limits (10/min)
 - [ ] 429 response with Retry-After header
+- [ ] Appropriate storage chosen (in-memory vs Redis based on deployment)
 
 ### Input & Output
 - [ ] All input validated with Zod schemas
 - [ ] Security headers configured
+- [ ] CSP with nonces (no unsafe-inline for scripts)
 - [ ] Error messages don't leak sensitive info
 - [ ] User content escaped in HTML emails
 
@@ -565,7 +727,8 @@ const emailHtml = `
 - [ ] API keys use secure random generation
 - [ ] Database queries use parameterized statements
 - [ ] Data access scoped by user/account
+- [ ] API routes verify auth at handler level (not just middleware)
 
 ---
 
-*Last updated: January 2026*
+*Last updated: January 16, 2026*
