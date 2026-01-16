@@ -8,6 +8,25 @@ This document outlines essential security practices for building secure web appl
 - **Never use hardcoded secret fallbacks** for JWT/session secrets
 - **Throw errors** if required secrets are not configured - fail fast rather than running insecurely
 - Use environment variables for all sensitive configuration
+- **Minimum secret length**: 32 characters for JWT secrets
+
+```typescript
+// Validate secrets at startup - fail fast if missing or weak
+function validateSecret(name: string, value: string | undefined): string {
+  if (!value) {
+    throw new Error(
+      `${name} environment variable is required.\n` +
+      `Generate a secure secret with: openssl rand -base64 32`
+    );
+  }
+  if (value.length < 32) {
+    throw new Error(`${name} must be at least 32 characters for security.`);
+  }
+  return value;
+}
+
+const JWT_SECRET = validateSecret('JWT_SECRET', process.env.JWT_SECRET);
+```
 
 ### Password Security
 - Use **bcrypt** or **argon2** for password hashing (never MD5, SHA1, or plain SHA256)
@@ -19,6 +38,17 @@ This document outlines essential security practices for building secure web appl
 - Use established libraries (e.g., `otplib`, `speakeasy`)
 - Provide backup codes for account recovery
 - Rate limit MFA verification attempts
+- **Enforce MFA completion** - verify `mfaVerified` flag before granting access to protected resources
+
+```typescript
+// In middleware - enforce MFA completion for admin routes
+if (adminPayload && !adminPayload.mfaVerified) {
+  return NextResponse.json(
+    { error: 'MFA verification required' },
+    { status: 401 }
+  );
+}
+```
 
 ### Session Security
 - Set secure cookie flags:
@@ -26,19 +56,50 @@ This document outlines essential security practices for building secure web appl
   - `Secure`: Only transmit over HTTPS (enable in production)
   - `SameSite=Lax` or `SameSite=Strict`: Prevents CSRF attacks
 - Use short token expiration times:
-  - 24 hours for general sessions
-  - Shorter durations for sensitive operations
+  - **2 hours** for regular user sessions
+  - **30 minutes** for admin/sensitive sessions
+  - Shorter durations for MFA pending states (5 minutes)
+- **Align cookie maxAge with JWT expiry** - mismatched values cause auth issues
 - Implement secure session invalidation on logout
 
 ```typescript
-// Example secure cookie configuration
-const cookieOptions = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax' as const,
-  maxAge: 24 * 60 * 60 * 1000, // 24 hours
-  path: '/',
-};
+// Export constants to ensure consistency
+export const TOKEN_EXPIRY = '2h';
+export const COOKIE_MAX_AGE = 2 * 60 * 60; // 2 hours in seconds
+
+// Always use the same constant for both
+const token = await generateToken(payload, secret, TOKEN_EXPIRY);
+response.headers.set('Set-Cookie',
+  createAuthCookie(COOKIE_NAME, token, COOKIE_MAX_AGE)
+);
+```
+
+### Token Refresh (Sliding Window)
+Implement automatic token refresh to maintain security while preserving user experience:
+
+- **Shorten base token expiry** (2h instead of 7d)
+- **Auto-refresh in middleware** when token approaches expiry
+- Define refresh windows (e.g., refresh when <1h remaining)
+
+```typescript
+// Check if token should be refreshed
+export function shouldRefreshToken(
+  payload: { exp?: number },
+  refreshWindowSeconds: number
+): boolean {
+  if (!payload.exp) return false;
+  const now = Math.floor(Date.now() / 1000);
+  const timeRemaining = payload.exp - now;
+  return timeRemaining > 0 && timeRemaining < refreshWindowSeconds;
+}
+
+// In middleware - refresh approaching-expiry tokens
+if (shouldRefreshToken(payload, REFRESH_WINDOW)) {
+  const newToken = await refreshToken(payload);
+  response.headers.set('Set-Cookie',
+    createAuthCookie(COOKIE_NAME, newToken, COOKIE_MAX_AGE)
+  );
+}
 ```
 
 ## 2. Rate Limiting
@@ -48,10 +109,20 @@ Rate limiting protects against brute force attacks, credential stuffing, and den
 
 ### Implementation Guidelines
 - **Always rate limit authentication endpoints**: login, MFA verification, password reset
-- **Recommended limit**: 5 attempts per 15 minutes for auth routes
+- **Rate limit ALL API endpoints** - not just auth (prevents DoS on data endpoints)
+- **Stricter limits for expensive operations**: exports, bulk operations, file uploads
 - Track by IP address using headers: `x-forwarded-for`, `x-real-ip`
 - Return **429 Too Many Requests** status when limit exceeded
 - Include `Retry-After` header with seconds until reset
+
+### Recommended Limits
+
+| Endpoint Type | Limit | Window |
+|---------------|-------|--------|
+| Auth (login, MFA) | 5 requests | 15 minutes |
+| Magic link / password reset | 5 per email, 20 per IP | 15 minutes |
+| General API endpoints | 100 requests | 1 minute |
+| Export / heavy operations | 10 requests | 1 minute |
 
 ### Response Headers
 Include rate limit information in responses:
@@ -60,18 +131,37 @@ Include rate limit information in responses:
 - `X-RateLimit-Reset`: Unix timestamp when limit resets
 
 ```typescript
-// Example rate limiter configuration
-const authRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    res.status(429).json({
-      error: 'Too many attempts. Please try again later.',
-    });
-  },
-});
+// In-memory sliding window rate limiter
+class RateLimiter {
+  private store: Map<string, number[]> = new Map();
+
+  constructor(
+    private maxRequests: number,
+    private windowMs: number
+  ) {}
+
+  check(key: string): { allowed: boolean; retryAfter?: number } {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+
+    let timestamps = this.store.get(key) || [];
+    timestamps = timestamps.filter(ts => ts > windowStart);
+
+    if (timestamps.length >= this.maxRequests) {
+      const retryAfter = Math.ceil((timestamps[0] + this.windowMs - now) / 1000);
+      return { allowed: false, retryAfter };
+    }
+
+    timestamps.push(now);
+    this.store.set(key, timestamps);
+    return { allowed: true };
+  }
+}
+
+// Create rate limiters for different endpoint types
+export const authLimiter = new RateLimiter(5, 15 * 60 * 1000);
+export const apiLimiter = new RateLimiter(100, 60 * 1000);
+export const exportLimiter = new RateLimiter(10, 60 * 1000);
 ```
 
 ## 3. Input Validation
@@ -114,43 +204,32 @@ Configure these headers on all responses to protect against common attacks:
 | `X-Content-Type-Options` | `nosniff` | Prevents MIME type sniffing |
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Enforces HTTPS |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Controls referrer information |
-| `Permissions-Policy` | Disable unused features | Restricts browser feature access |
-| `X-XSS-Protection` | `1; mode=block` | Legacy XSS protection |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | Restricts browser feature access |
 
 ### Next.js Example
 ```typescript
-// next.config.js
+// next.config.ts
 const securityHeaders = [
+  { key: 'X-Frame-Options', value: 'DENY' },
+  { key: 'X-Content-Type-Options', value: 'nosniff' },
+  { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+  { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
   {
-    key: 'X-Frame-Options',
-    value: 'DENY',
-  },
-  {
-    key: 'X-Content-Type-Options',
-    value: 'nosniff',
-  },
-  {
-    key: 'Strict-Transport-Security',
-    value: 'max-age=31536000; includeSubDomains',
-  },
-  {
-    key: 'Referrer-Policy',
-    value: 'strict-origin-when-cross-origin',
-  },
-  {
-    key: 'X-XSS-Protection',
-    value: '1; mode=block',
+    key: 'Content-Security-Policy',
+    value: [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https://*.s3.*.amazonaws.com",
+      "connect-src 'self' https://*.s3.*.amazonaws.com",
+      "frame-ancestors 'none'",
+    ].join('; '),
   },
 ];
 
-module.exports = {
+export default {
   async headers() {
-    return [
-      {
-        source: '/(.*)',
-        headers: securityHeaders,
-      },
-    ];
+    return [{ source: '/:path*', headers: securityHeaders }];
   },
 };
 ```
@@ -198,24 +277,40 @@ const userData = await prisma.resource.findMany({
 - Use **prepared statements** for raw queries when necessary
 
 ### Connection Security
-- Use **SSL/TLS connections** in production
-- Configure connection pooling appropriately
+- Use **SSL/TLS connections** for remote databases
+- **Smart SSL configuration** - disable for localhost, enable for remote
+- Configure **connection pooling** to prevent resource exhaustion
 - Use least-privilege database accounts
+
+```typescript
+// Smart SSL configuration based on environment
+function getSslConfig() {
+  const dbUrl = process.env.DATABASE_URL || '';
+  const isLocalhost = dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1');
+
+  // No SSL for local development
+  if (isLocalhost) return undefined;
+
+  // Strict SSL for production, relaxed for dev with remote DB
+  return process.env.NODE_ENV === 'production'
+    ? { rejectUnauthorized: true }
+    : { rejectUnauthorized: false };
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: getSslConfig(),
+  max: 20,                    // Maximum connections
+  min: 2,                     // Minimum idle connections
+  idleTimeoutMillis: 30000,   // Close idle connections after 30s
+});
+```
 
 ### Data Protection
 - Implement **row-level security** where possible
 - Encrypt sensitive data at rest
 - **Regular backups** with encryption
 - Test backup restoration periodically
-
-```typescript
-// Prisma SSL configuration example
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-  // In production, DATABASE_URL should include ?sslmode=require
-}
-```
 
 ## 7. Secrets Management
 
@@ -227,26 +322,24 @@ datasource db {
 - **Rotate secrets** regularly, especially after team member departures
 
 ### Environment Variable Validation
+Validate ALL critical service credentials at startup:
+
 ```typescript
-// Validate required environment variables at startup
-function validateEnv() {
-  const required = [
-    'DATABASE_URL',
-    'JWT_SECRET',
-    'SESSION_SECRET',
-  ];
-
-  const missing = required.filter(key => !process.env[key]);
-
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables: ${missing.join(', ')}`
-    );
+function validateEnvVar(name: string): string {
+  const value = process.env[name];
+  if (!value || value.trim() === '') {
+    throw new Error(`Missing required environment variable: ${name}`);
   }
+  return value;
 }
 
-// Call at application startup
-validateEnv();
+// Validate at module load time - fail fast
+const DATABASE_URL = validateEnvVar('DATABASE_URL');
+const JWT_SECRET = validateEnvVar('JWT_SECRET');
+const AWS_ACCESS_KEY_ID = validateEnvVar('AWS_ACCESS_KEY_ID');
+const AWS_SECRET_ACCESS_KEY = validateEnvVar('AWS_SECRET_ACCESS_KEY');
+const AWS_S3_BUCKET = validateEnvVar('AWS_S3_BUCKET');
+const SENDGRID_API_KEY = validateEnvVar('SENDGRID_API_KEY');
 ```
 
 ### .gitignore Example
@@ -289,30 +382,78 @@ const config = {
 ## 9. File Uploads
 
 ### Validation Requirements
-- **Validate file types** - don't trust MIME type alone, check magic bytes
+- **Validate file types using magic bytes** - don't trust MIME type or extension alone
 - Set **file size limits** appropriate to your use case
 - **Scan for malware** if possible (ClamAV, cloud scanning services)
 - **Generate random filenames** - never use user-provided names directly
 
-### Storage Best Practices
-- Store files **outside the web root** or use signed URLs
-- Use cloud storage (S3, GCS) with proper access controls
-- Set appropriate Content-Disposition headers for downloads
+### Magic Byte Verification
+Use the `file-type` package to verify actual file content:
 
 ```typescript
-import crypto from 'crypto';
-import path from 'path';
+import { fileTypeFromBuffer } from 'file-type';
 
-function generateSafeFilename(originalName: string): string {
-  const ext = path.extname(originalName).toLowerCase();
-  const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.pdf'];
+const ALLOWED_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+]);
 
-  if (!allowedExtensions.includes(ext)) {
-    throw new Error('File type not allowed');
+async function verifyFileType(buffer: Buffer): Promise<{
+  valid: boolean;
+  detectedType?: string;
+  error?: string;
+}> {
+  // Check for PDF magic bytes manually (file-type can miss some PDFs)
+  const pdfMagic = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
+  if (buffer.length >= 4 && buffer.subarray(0, 4).equals(pdfMagic)) {
+    return { valid: true, detectedType: 'application/pdf' };
   }
 
-  const randomName = crypto.randomBytes(16).toString('hex');
-  return `${randomName}${ext}`;
+  const fileType = await fileTypeFromBuffer(buffer);
+
+  if (!fileType) {
+    return { valid: false, error: 'Unable to determine file type' };
+  }
+
+  if (!ALLOWED_MIME_TYPES.has(fileType.mime)) {
+    return {
+      valid: false,
+      detectedType: fileType.mime,
+      error: `Invalid file type: ${fileType.mime}`
+    };
+  }
+
+  return { valid: true, detectedType: fileType.mime };
+}
+```
+
+### S3 Storage Best Practices
+- **Store S3 keys, not public URLs** - generate presigned URLs on demand
+- Use **presigned URLs** for both uploads and downloads
+- Set appropriate bucket policies (private by default)
+- Verify files server-side after upload before storing references
+
+```typescript
+// Extract S3 key from URL for verification
+function extractS3KeyFromUrl(fileUrl: string): string | null {
+  try {
+    const url = new URL(fileUrl);
+    return url.pathname.startsWith('/') ? url.pathname.slice(1) : url.pathname;
+  } catch {
+    return null;
+  }
+}
+
+// Download partial file for verification (first 8KB is enough for magic bytes)
+async function getFileHead(fileKey: string, bytes: number = 8192): Promise<Buffer> {
+  const command = new GetObjectCommand({
+    Bucket: AWS_S3_BUCKET,
+    Key: fileKey,
+    Range: `bytes=0-${bytes - 1}`,
+  });
+  const response = await s3Client.send(command);
+  // Convert stream to buffer...
 }
 ```
 
@@ -324,18 +465,20 @@ function generateSafeFilename(originalName: string): string {
 - Return **generic error messages** to clients
 - Use **consistent error response format**
 - Use `try/catch` blocks consistently
+- **Sanitize logged data** - don't log passwords, tokens, or full query parameters
 
 ### Implementation Example
 ```typescript
 // Error handler middleware
 function errorHandler(err: Error, req: Request, res: Response, next: NextFunction) {
-  // Log full error details server-side
+  // Log full error details server-side (sanitized)
   console.error('Error:', {
     message: err.message,
     stack: err.stack,
     path: req.path,
     method: req.method,
     timestamp: new Date().toISOString(),
+    // Don't log: req.body, req.headers.authorization, etc.
   });
 
   // Return safe error to client
@@ -349,23 +492,79 @@ function errorHandler(err: Error, req: Request, res: Response, next: NextFunctio
 }
 ```
 
+## 11. Email Security
+
+### HTML Content Escaping
+Always escape user-provided content before inserting into HTML emails to prevent XSS in email clients:
+
+```typescript
+function escapeHtml(text: string): string {
+  const htmlEntities: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  };
+  return text.replace(/[&<>"']/g, (char) => htmlEntities[char]);
+}
+
+// Use in email templates
+const emailHtml = `
+  <p>Hello ${escapeHtml(companyName)},</p>
+  <p>Invoice ${escapeHtml(invoiceNumber)} has been ${escapeHtml(status)}.</p>
+  ${notes ? `<p>Notes: ${escapeHtml(notes)}</p>` : ''}
+`;
+```
+
+### Email Best Practices
+- Validate email service credentials at startup
+- Use established email services (SendGrid, AWS SES, Postmark)
+- Implement proper SPF, DKIM, and DMARC records
+- Rate limit email sending to prevent abuse
+
 ---
 
 ## Quick Reference Checklist
 
-- [ ] JWT/session secrets are required (no fallbacks)
+### Authentication & Sessions
+- [ ] JWT/session secrets are required (no fallbacks, min 32 chars)
 - [ ] Passwords hashed with bcrypt/argon2
-- [ ] Secure cookie flags configured
-- [ ] Rate limiting on auth endpoints
+- [ ] Secure cookie flags configured (HttpOnly, Secure, SameSite)
+- [ ] Cookie maxAge matches JWT expiry
+- [ ] Token refresh (sliding window) implemented
+- [ ] MFA completion enforced before resource access
+
+### Rate Limiting
+- [ ] Auth endpoints rate limited (5/15min)
+- [ ] All API endpoints rate limited (100/min)
+- [ ] Export/heavy operations stricter limits (10/min)
+- [ ] 429 response with Retry-After header
+
+### Input & Output
 - [ ] All input validated with Zod schemas
 - [ ] Security headers configured
+- [ ] Error messages don't leak sensitive info
+- [ ] User content escaped in HTML emails
+
+### Infrastructure
+- [ ] All secrets in environment variables
+- [ ] All critical env vars validated at startup
+- [ ] .env files in .gitignore
+- [ ] SSL enabled for remote databases
+- [ ] Database connection pool configured
+- [ ] Production environment properly configured
+
+### File Handling
+- [ ] File types verified with magic bytes
+- [ ] S3 keys stored (not public URLs)
+- [ ] Presigned URLs used for access
+- [ ] File size limits enforced server-side
+
+### API Security
 - [ ] API keys use secure random generation
 - [ ] Database queries use parameterized statements
-- [ ] All secrets in environment variables
-- [ ] .env files in .gitignore
-- [ ] Production environment properly configured
-- [ ] File uploads validated and stored securely
-- [ ] Error messages don't leak sensitive info
+- [ ] Data access scoped by user/account
 
 ---
 
